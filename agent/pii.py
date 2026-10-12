@@ -30,10 +30,60 @@ set ở tests/vn_pii_testset.jsonl):
 """
 from __future__ import annotations
 
+import re
+
+
+_EMAIL_RE = re.compile(
+    r"(?<![\w.+-])[\w.!#$%&'*+/=?^`{|}~-]+@[\w-]+(?:\.[\w-]+)+(?![\w.-])"
+)
+_CCCD_RE = re.compile(r"(?<!\d)\d{12}(?!\d)")
+_PHONE_RE = re.compile(r"(?<!\d)0(?:[\s-]?\d){9,10}(?!\d)")
+_BANK_RE = re.compile(
+    r"(?i)(?:\bSTK\b|\bsố\s+tài\s+kh[oảa]n\b)\s*:?\s*(\d{8,16})(?!\d)"
+)
+
+
+def _entity(entity_type: str, match: re.Match[str], group: int = 0) -> dict:
+    start, end = match.span(group)
+    return {"type": entity_type, "start": start, "end": end}
+
+
+def _overlaps(first: dict, second: dict) -> bool:
+    return first["start"] < second["end"] and second["start"] < first["end"]
+
 
 def detect(text: str) -> list[dict]:
-    raise NotImplementedError("BƯỚC 3a: implement PII detection")
+    candidates: list[dict] = []
+    candidates.extend(_entity("EMAIL", match) for match in _EMAIL_RE.finditer(text))
+    candidates.extend(_entity("VN_BANK_ACCOUNT", match, 1) for match in _BANK_RE.finditer(text))
+    candidates.extend(_entity("VN_CCCD", match) for match in _CCCD_RE.finditer(text))
+    candidates.extend(_entity("VN_PHONE", match) for match in _PHONE_RE.finditer(text))
+
+    # Keep the more specific/contextual match when numeric patterns overlap.
+    selected: list[dict] = []
+    for candidate in sorted(
+        candidates,
+        key=lambda item: (
+            item["start"],
+            {"EMAIL": 0, "VN_BANK_ACCOUNT": 1, "VN_CCCD": 2, "VN_PHONE": 3}[
+                item["type"]
+            ],
+            -(item["end"] - item["start"]),
+        ),
+    ):
+        if not any(_overlaps(candidate, existing) for existing in selected):
+            selected.append(candidate)
+
+    return sorted(selected, key=lambda item: item["start"])
 
 
 def redact(text: str) -> str:
-    raise NotImplementedError("BƯỚC 3a: implement PII redaction")
+    redacted = text
+    for entity in sorted(detect(text), key=lambda item: item["start"], reverse=True):
+        replacement = f"[REDACTED_{entity['type']}]"
+        redacted = (
+            redacted[: entity["start"]]
+            + replacement
+            + redacted[entity["end"] :]
+        )
+    return redacted

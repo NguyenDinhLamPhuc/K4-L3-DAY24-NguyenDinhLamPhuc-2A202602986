@@ -59,10 +59,21 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from agent import ledger, tools
+from agent import pii
+from agent.policy import PolicyContext, check
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
+CUSTOMERS_FILE = Path(__file__).resolve().parent.parent / "data" / "customers.json"
+TICKET_ID_RE = re.compile(r"^ticket-(\d+)\.md$")
 
 
 class RunnerScaffoldPending(NotImplementedError):
@@ -71,4 +82,104 @@ class RunnerScaffoldPending(NotImplementedError):
 
 def handle(message: str, llm, log_dir: Path | None = None,
            principal_id: str = "support_l1") -> str:
-    raise RunnerScaffoldPending("BƯỚC 3c: implement trifecta split")
+    run_id = uuid.uuid4().hex
+    agent_id = f"lab24-agent/{run_id}"
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(minutes=15)
+    ).isoformat()
+    ledger_path = (log_dir / "ledger.jsonl") if log_dir else DEFAULT_LEDGER_PATH
+    agent_scopes = ("search_docs", "read_customer")
+
+    def call_tool(
+        tool_name: str,
+        classification: str,
+        args: dict,
+        function=None,
+        *,
+        request_purpose: str = "summarize-tickets",
+        egress_enabled: bool = False,
+    ):
+        context = PolicyContext(
+            data_classification=classification,
+            request_purpose=request_purpose,
+            agent_owner=agent_id,
+            delegation_depth=0,
+            egress_enabled=egress_enabled,
+            principal_id=principal_id,
+            requested_tool=tool_name,
+            agent_scopes=agent_scopes + ("http_post",),
+            expires_at=expires_at,
+        )
+        allowed, reason = check(context)
+        encoded_args = json.dumps(args, sort_keys=True, ensure_ascii=False).encode(
+            "utf-8"
+        )
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": agent_id,
+            "run_id": run_id,
+            "tool": tool_name,
+            "args_hash": hashlib.sha256(encoded_args).hexdigest(),
+            "classification": classification,
+            "decision": "allow" if allowed else "deny",
+            "reason": reason,
+            "on_behalf_of": principal_id,
+            "expires_at": expires_at,
+        }
+        ledger.append(entry, ledger_path)
+        if not allowed:
+            return None
+        return function() if function is not None else None
+
+    docs = call_tool(
+        "search_docs",
+        "internal",
+        {"query": message},
+        lambda: tools.search_docs(message),
+    )
+    docs = docs or []
+
+    # Run B uses only ticket IDs from trusted filenames, never IDs extracted
+    # from untrusted document text.
+    injected = llm.find_injection(
+        "\n\n".join(document["text"] for document in docs)
+    )
+    if injected is not None:
+        call_tool(
+            "http_post",
+            "restricted",
+            {"url": injected.target_url},
+            request_purpose="support-reply",
+            egress_enabled=True,
+        )
+
+    customers = json.loads(CUSTOMERS_FILE.read_text(encoding="utf-8"))
+    customers_by_ticket = {
+        ticket_id: customer["customer_id"]
+        for customer in customers
+        for ticket_id in customer.get("related_tickets", [])
+    }
+    ticket_ids = []
+    for document in docs:
+        match = TICKET_ID_RE.match(str(document.get("id", "")))
+        if match:
+            ticket_id = int(match.group(1))
+            if ticket_id not in ticket_ids:
+                ticket_ids.append(ticket_id)
+
+    for ticket_id in ticket_ids:
+        customer_id = customers_by_ticket.get(ticket_id)
+        if customer_id is None:
+            continue
+        call_tool(
+            "read_customer",
+            "restricted",
+            {"customer_id": customer_id},
+            lambda customer_id=customer_id: tools.read_customer(customer_id),
+        )
+
+    redacted_docs = [
+        {**document, "text": pii.redact(document["text"])}
+        for document in docs
+    ]
+    return llm.summarize(redacted_docs)

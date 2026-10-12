@@ -1,5 +1,5 @@
 # Baseline — điền trong checkpoint 1
 
-1. Agent có identity mỗi run chưa? Dẫn file/hàm:
-2. Ai cho phép `http_post`? Dẫn file/hàm:
-3. Nếu gửi sai PII ra sink, bằng chứng ở đâu? Dẫn file/hàm:
+1. Agent có identity mỗi run chưa? Dẫn file/hàm: Chưa có. naive_loop() chỉ nhận message và llm, không có agent_id, run_id hay danh tính người dùng: agent/loop.py dòng 27. principal_id chỉ được truyền vào runner.handle() ở agent/loop.py dòng 69 chứ không đi vào baseline naive_loop() để kiểm quyền.
+2. Ai cho phép `http_post`? Dẫn file/hàm: Không có policy nào kiểm mục đích, quyền và loại dữ liệu trước http_post. Sau khi find_injection() trả về chỉ thị, chính naive_loop() lấy customer_ids, gọi read_customer(), rồi tự tạo và gửi dữ liệu ở agent/loop.py dòng 34 - 44. http_post() chỉ giới hạn đích ở localhost tại agent/tools.py:68-84, không quyết định dữ liệu nào được gửi. Nói cách khác, ticket là dữ liệu nhưng baseline xử lý chỉ thị bên trong như lệnh; chưa có cổng kiểm quyền giữa read_customer() và http_post().
+3. Nếu gửi sai PII ra sink, bằng chứng ở đâu? Dẫn file/hàm: Body POST được tạo ngay trong lời gọi tools.http_post(injected.target_url, {"records": collected}) ở agent/loop.py dòng 44. Sink nhận request rồi ghi cả path và body vào reports/sink.log tại sink/sink.py dòng 45 - 47.

@@ -34,7 +34,10 @@ không phải xác thực người dùng production.
 """
 from __future__ import annotations
 
+import json
+from datetime import datetime, timezone
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -52,4 +55,58 @@ class PolicyContext:
 
 
 def check(context: PolicyContext) -> tuple[bool, str]:
-    raise NotImplementedError("BƯỚC 3b: implement policy check")
+    allowed_classifications = {"public", "internal", "restricted"}
+    if context.data_classification not in allowed_classifications:
+        return False, "data_classification không hợp lệ"
+
+    if context.data_classification == "restricted" and context.egress_enabled:
+        return False, "restricted data không được phép egress"
+
+    if not context.agent_owner.strip():
+        return False, "agent_owner bị thiếu"
+    if context.delegation_depth < 0:
+        return False, "delegation_depth không hợp lệ"
+    if not context.principal_id.strip():
+        return False, "principal_id bị thiếu"
+    if not context.request_purpose.strip():
+        return False, "request_purpose bị thiếu"
+    if not context.requested_tool.strip():
+        return False, "requested_tool bị thiếu"
+    if not context.agent_scopes:
+        return False, "agent_scopes bị thiếu"
+    if context.delegation_depth > 0 and not context.parent_scopes:
+        return False, "parent_scopes bị thiếu khi delegation"
+
+    principals_path = Path(__file__).resolve().parent.parent / "data" / "principals.json"
+    try:
+        principals = json.loads(principals_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False, "không thể đọc danh sách principal"
+
+    principal = principals.get(context.principal_id)
+    if not isinstance(principal, dict):
+        return False, "principal không xác định"
+
+    allowed_tools = principal.get("allowed_tools")
+    purposes = principal.get("purposes")
+    if not isinstance(allowed_tools, list) or not isinstance(purposes, list):
+        return False, "principal thiếu policy quyền hạn"
+    if context.request_purpose not in purposes:
+        return False, "purpose không được principal cho phép"
+
+    effective_scopes = set(allowed_tools).intersection(context.agent_scopes)
+    if context.delegation_depth > 0:
+        effective_scopes.intersection_update(context.parent_scopes)
+    if context.requested_tool not in effective_scopes:
+        return False, "requested_tool nằm ngoài phạm vi quyền hiệu lực"
+
+    try:
+        expires_at = datetime.fromisoformat(context.expires_at.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return False, "expires_at không hợp lệ"
+    if expires_at.tzinfo is None:
+        return False, "expires_at phải có timezone UTC"
+    if expires_at.astimezone(timezone.utc) <= datetime.now(timezone.utc):
+        return False, "run đã hết hạn"
+
+    return True, "policy hợp lệ: principal, purpose, tool, scope và thời hạn đều được phép"
